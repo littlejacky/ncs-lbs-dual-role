@@ -1,0 +1,29 @@
+# Zephyr / NCS / west
+build/
+out/
+zephyr/
+west/
+prj.conf.orig
+
+# Ninja / CMake
+*.o
+*.d
+*.dSYM/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+install_manifest.txt
+Makefile
+*.elf
+*.bin
+*.hex
+*.uf2
+
+# IDE
+.vscode/
+.idea/
+
+# 临时文件
+*~
+*.swp
