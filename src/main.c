@@ -598,96 +598,119 @@ static void advertising_start(void)
 /* Enhanced connection callbacks with ring state management */
 static void connected(struct bt_conn *conn, uint8_t conn_err)
 {
-	int err;
-	struct bt_conn_info info;
-	char addr[BT_ADDR_LE_STR_LEN];
+    int err;
+    struct bt_conn_info info;
+    char addr[BT_ADDR_LE_STR_LEN];
 
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-	if (conn_err) {
-		printk("❌ Failed to connect to %s: 0x%02x %s\n", addr, conn_err,
-		       bt_hci_err_to_str(conn_err));
+    if (conn_err) {
+        printk("❌ Failed to connect to %s: 0x%02x %s\n",
+               addr, conn_err, bt_hci_err_to_str(conn_err));
 
-		if (conn == central_ring.conn) {
-			bt_conn_unref(central_ring.conn);
-			memset(&central_ring, 0, sizeof(central_ring));
-			scan_start();
-		}
-		return;
-	}
+        /* 保留连接失败后的重试逻辑 */
+        if (conn == central_ring.conn) {
+            bt_conn_unref(central_ring.conn);
+            memset(&central_ring, 0, sizeof(central_ring));
+            scan_start();  /* 失败后重启扫描 */
+        }
+        return;
+    }
 
-	printk("🔗 Connected: %s\n", addr);
+    printk("🔗 Connected: %s\n", addr);
 
-	err = bt_conn_get_info(conn, &info);
-	if (err) {
-		printk("❌ Failed to get connection info (err %d)\n", err);
-		return;
-	}
+    err = bt_conn_get_info(conn, &info);
+    if (err) {
+        printk("❌ Failed to get connection info (err %d)\n", err);
+        return;
+    }
 
-	if (info.role == BT_CONN_ROLE_CENTRAL) {
-		printk("💍 Connected to partner ring as Central\n");
-		dk_set_led_on(CENTRAL_CON_STATUS_LED);
-		
-		/* Initialize central ring state */
-		central_ring.conn = conn;
-		central_ring.current_rssi = -50; /* Default initial RSSI estimate */
-		central_ring.distance = estimate_distance(central_ring.current_rssi);
-		
-		printk("📶 Initial estimated distance: %s\n", 
-		       distance_str[central_ring.distance]);
+    if (info.role == BT_CONN_ROLE_CENTRAL) {
+        /* —— Central 成功连上后，马上停止扫描 —— */
+        err = bt_scan_stop();
+        if (err) {
+            printk("⚠ Failed to stop scan (err %d)\n", err);
+        }
 
-		err = bt_conn_set_security(conn, BT_SECURITY_L2);
-		if (err) {
-			printk("⚠ Failed to set security (err %d)\n", err);
-			gatt_discover(conn);
-		}
-		
-		/* Start RSSI monitoring */
-		k_work_schedule(&rssi_work, K_MSEC(RSSI_UPDATE_INTERVAL));
-		
-	} else {
-		printk("💍 Partner ring connected as Peripheral\n");
-		dk_set_led_on(PERIPHERAL_CONN_STATUS_LED);
-		
-		/* Initialize peripheral ring state */
-		peripheral_ring.conn = conn;
-		peripheral_ring.current_rssi = -45; /* Default initial RSSI estimate */
-		peripheral_ring.distance = estimate_distance(peripheral_ring.current_rssi);
-		
-		/* Start RSSI monitoring if not already running */
-		k_work_schedule(&rssi_work, K_MSEC(RSSI_UPDATE_INTERVAL));
-	}
+        printk("💍 Connected to partner ring as Central\n");
+        dk_set_led_on(CENTRAL_CON_STATUS_LED);
+
+        /* 初始化 Central 状态 */
+        central_ring.conn        = conn;
+        central_ring.current_rssi = -50;
+        central_ring.distance     = estimate_distance(central_ring.current_rssi);
+        printk("📶 Initial estimated distance: %s\n",
+               distance_str[central_ring.distance]);
+
+        /* 1) 请求加密（若异步进行或立刻返回 0，都无碍） */
+        err = bt_conn_set_security(conn, BT_SECURITY_L2);
+        if (err) {
+            printk("⚠ Failed to set security (err %d), will discover anyway\n", err);
+        }
+
+        /* 2) **无论加密是否立刻成功，都强制走一遍 GATT 发现** */
+        gatt_discover(conn);
+
+        /* 启动 RSSI 监测 */
+        k_work_schedule(&rssi_work, K_MSEC(RSSI_UPDATE_INTERVAL));
+
+    } else {
+        /* —— Peripheral 被连入后，马上停止广播 —— */
+        err = bt_le_adv_stop();
+        if (err) {
+            printk("⚠ Failed to stop advertising (err %d)\n", err);
+        }
+
+        printk("💍 Partner ring connected as Peripheral\n");
+        dk_set_led_on(PERIPHERAL_CONN_STATUS_LED);
+
+        /* 初始化 Peripheral 状态 */
+        peripheral_ring.conn        = conn;
+        peripheral_ring.current_rssi = -45;
+        peripheral_ring.distance     = estimate_distance(peripheral_ring.current_rssi);
+
+        /* 如果你也需要当 Peripheral 端做 GATT 发现（一般是不用的），
+           可以在这里调用 gatt_discover(conn)。 */
+
+        /* 启动 RSSI 监测 */
+        k_work_schedule(&rssi_work, K_MSEC(RSSI_UPDATE_INTERVAL));
+    }
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
-	char addr[BT_ADDR_LE_STR_LEN];
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+    char addr[BT_ADDR_LE_STR_LEN];
 
-	printk("🔌 Disconnected: %s, reason 0x%02x %s\n", addr, reason, 
-	       bt_hci_err_to_str(reason));
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+    printk("🔌 Disconnected: %s, reason 0x%02x %s\n",
+           addr, reason, bt_hci_err_to_str(reason));
 
-	if (conn == central_ring.conn) {
-		printk("💔 Partner ring disconnected (Central)\n");
-		dk_set_led_off(CENTRAL_CON_STATUS_LED);
+    /* Central 通道挂了，清理并重启扫描 */
+    if (conn == central_ring.conn) {
+        printk("💔 Partner ring disconnected (Central)\n");
+        dk_set_led_off(CENTRAL_CON_STATUS_LED);
 
-		/* Clean up subscriptions */
-		if (lbs_client_ctx.subscribed) {
-			lbs_client_ctx.subscribed = false;
-		}
+        if (lbs_client_ctx.subscribed) {
+            lbs_client_ctx.subscribed = false;
+        }
 
-		bt_conn_unref(central_ring.conn);
-		memset(&central_ring, 0, sizeof(central_ring));
-		scan_start();
-		
-	} else if (conn == peripheral_ring.conn) {
-		printk("💔 Partner ring disconnected (Peripheral)\n");
-		dk_set_led_off(PERIPHERAL_CONN_STATUS_LED);
-		memset(&peripheral_ring, 0, sizeof(peripheral_ring));
-	}
-	
-	/* Reset LBS client context on any disconnection */
-	memset(&lbs_client_ctx, 0, sizeof(lbs_client_ctx));
+        bt_conn_unref(central_ring.conn);
+        memset(&central_ring, 0, sizeof(central_ring));
+
+        scan_start();      /* 断开后重启扫描 */
+    }
+    /* Peripheral 通道挂了，清理并重启广播 */
+    else if (conn == peripheral_ring.conn) {
+        printk("💔 Partner ring disconnected (Peripheral)\n");
+        dk_set_led_off(PERIPHERAL_CONN_STATUS_LED);
+
+        memset(&peripheral_ring, 0, sizeof(peripheral_ring));
+
+        advertising_start();  /* 断开后重启广播 */
+    }
+
+    /* 无论哪个通道断开，都重置 LBS client 上下文 */
+    memset(&lbs_client_ctx, 0, sizeof(lbs_client_ctx));
 }
 
 static void security_changed(struct bt_conn *conn, bt_security_t level,
