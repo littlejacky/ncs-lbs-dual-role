@@ -43,6 +43,7 @@
 #define HR_SYNC_THRESHOLD 15
 #define HR_HIGH_THRESHOLD 110
 #define HR_LOW_THRESHOLD 50
+#define DEBOUNCE_MS 70
 
 typedef enum {
 	DISTANCE_UNKNOWN,
@@ -179,15 +180,17 @@ static uint8_t lbs_button_notify_cb(struct bt_conn *conn,
 	uint32_t now = k_uptime_get_32();
 	if (!data) { atomic_set(&lbs_client_ctx.subscribed,0); printk("Button sub removed\n"); return BT_GATT_ITER_STOP; }
 	if (length<1) return BT_GATT_ITER_CONTINUE;
-	if (now-lbs_client_ctx.last_button_time < 200) return BT_GATT_ITER_CONTINUE;
+	if (now-lbs_client_ctx.last_button_time < DEBOUNCE_MS) return BT_GATT_ITER_CONTINUE;
 	lbs_client_ctx.last_button_time = now;
 	uint8_t button_pressed = ((const uint8_t *)data)[0];
 	printk("👆 Partner button %s\n", button_pressed?"PRESSED":"RELEASED");
 	if (button_pressed) {
-		dk_set_led(CENTRAL_CON_STATUS_LED, true); k_sleep(K_MSEC(100));
-		dk_set_led(CENTRAL_CON_STATUS_LED, central_ring.conn?true:false);
-		led_set_state_locked(LED_STATE_FLASHING, false);
+		// dk_set_led(CENTRAL_CON_STATUS_LED, true); k_sleep(K_MSEC(100));
+		// dk_set_led(CENTRAL_CON_STATUS_LED, central_ring.conn?true:false);
+		led_set_state_locked(LED_STATE_ON, button_pressed);
 		printk("💕 Remote touch via button\n");
+	}else{
+		led_set_state_locked(LED_STATE_OFF, button_pressed);
 	}
 	return BT_GATT_ITER_CONTINUE;
 }
@@ -240,7 +243,7 @@ static void button_changed(uint32_t button_state, uint32_t has_changed) {
 	static uint32_t last_button_time = 0;
 	uint32_t now = k_uptime_get_32();
 	if (has_changed & USER_BUTTON) {
-		if (now - last_button_time < 200) return;
+		if (now - last_button_time < DEBOUNCE_MS) return;
 		last_button_time = now;
 		bool pressed = button_state & USER_BUTTON;
 		printk("Button %s\n", pressed ? "PRESSED" : "RELEASED");
@@ -250,9 +253,9 @@ static void button_changed(uint32_t button_state, uint32_t has_changed) {
 		if (err) printk("Failed to send button state: %d\n", err);
 
 		if (pressed)
-			led_set_state_locked(LED_STATE_FLASHING, true);
+			led_set_state_locked(LED_STATE_ON, pressed);
 		else
-			led_set_state_locked(LED_STATE_OFF, false);
+			led_set_state_locked(LED_STATE_OFF, pressed);
 
 		if (central_ring.conn && central_ring.lbs_ready &&
 		    lbs_client_ctx.led_value_handle &&
@@ -391,7 +394,7 @@ static void gatt_discover(struct bt_conn *conn) {
 static void app_led_cb(bool led_state) {
 	if (led_state) {
 		printk("💕 Remote touch via LED\n");
-		led_set_state_locked(LED_STATE_FLASHING, led_state);
+		led_set_state_locked(LED_STATE_ON, led_state);
 	} else {
 		led_set_state_locked(LED_STATE_OFF, led_state);
 	}
@@ -432,70 +435,116 @@ static void adv_work_handler(struct k_work *work) {
 }
 static void advertising_start(void) { k_work_submit(&adv_work); }
 static void reconnect_work_handler(struct k_work *work) {
-	printk("Restart adv & scan...\n");
-	advertising_start();
-	scan_start();
+    static bool last_role_was_central = false;
+    printk("Restart adv & scan...\n");
+    if (!last_role_was_central) {
+        // 先试做central（scan），一会儿再试做peripheral（adv），防止死锁
+        scan_start();
+        k_work_schedule(&reconnect_work, K_MSEC(1500)); // 1.5s后自动切
+        last_role_was_central = true;
+    } else {
+        advertising_start();
+        k_work_schedule(&reconnect_work, K_MSEC(1500));
+        last_role_was_central = false;
+    }
 }
 static void connected(struct bt_conn *conn, uint8_t conn_err)
 {
-	struct bt_conn_info info; char addr[BT_ADDR_LE_STR_LEN];
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-	if (conn_err) {
-		printk("Conn failed: %s, err: 0x%02x\n", addr, conn_err);
-		if (conn==central_ring.conn) {
-			bt_conn_unref(central_ring.conn); memset(&central_ring,0,sizeof(central_ring));
-			rssi_filter_init(&central_ring.rssi_filter);
-			k_work_schedule(&reconnect_work, K_SECONDS(2));
-		}
-		return;
-	}
-	printk("Connected: %s\n", addr);
-	if (bt_conn_get_info(conn, &info)) { printk("Conn info err\n"); return; }
-	if (info.role == BT_CONN_ROLE_CENTRAL) {
-		bt_scan_stop(); printk("As CENTRAL\n");
-		dk_set_led_on(CENTRAL_CON_STATUS_LED);
-		central_ring.conn = bt_conn_ref(conn);
-		central_ring.current_rssi = -50;
-		central_ring.distance = estimate_distance(-50);
-		central_ring.connection_time = k_uptime_get_32();
-		rssi_filter_init(&central_ring.rssi_filter);
-		printk("Initial dist: %s\n", distance_str[central_ring.distance]);
-		int err = bt_conn_set_security(conn, BT_SECURITY_L2);
-		if (err) printk("Set security fail: %d\n", err);
-		gatt_discover(conn);
-		k_work_schedule(&rssi_work, K_MSEC(RSSI_UPDATE_INTERVAL));
-	} else if (info.role == BT_CONN_ROLE_PERIPHERAL) {
-		bt_le_adv_stop(); printk("As PERIPHERAL\n");
-		dk_set_led_on(PERIPHERAL_CONN_STATUS_LED);
-		peripheral_ring.conn = bt_conn_ref(conn);
-		peripheral_ring.current_rssi = -45;
-		peripheral_ring.distance = estimate_distance(-45);
-		peripheral_ring.connection_time = k_uptime_get_32();
-		rssi_filter_init(&peripheral_ring.rssi_filter);
-		k_work_schedule(&rssi_work, K_MSEC(RSSI_UPDATE_INTERVAL));
-	}
+    struct bt_conn_info info;
+    char addr[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+    if (conn_err) {
+        printk("Conn failed: %s, err: 0x%02x\n", addr, conn_err);
+        if (conn==central_ring.conn) {
+            bt_conn_unref(central_ring.conn); memset(&central_ring,0,sizeof(central_ring));
+            rssi_filter_init(&central_ring.rssi_filter);
+            k_work_schedule(&reconnect_work, K_SECONDS(2));
+        }
+        return;
+    }
+    if (bt_conn_get_info(conn, &info)) {
+        printk("Conn info err\n"); return;
+    }
+
+    // ===== 检查是否和同一个设备双连接，若是则断开新连接 =====
+    const bt_addr_le_t *new_addr = bt_conn_get_dst(conn);
+    const bt_addr_le_t *other_addr = NULL;
+    if (info.role == BT_CONN_ROLE_CENTRAL && peripheral_ring.conn) {
+        other_addr = bt_conn_get_dst(peripheral_ring.conn);
+        // 如果已经作为peripheral连了同一个设备，则断掉现在新建立的central连接
+        if (!bt_addr_le_cmp(new_addr, other_addr)) {
+            // 同设备双连，断掉本次连接（你也可以选择断掉另一条conn）
+            printk("Duplicate conn (CENTRAL/PERIPHERAL to same peer)! Disconnecting new conn (%s)\n", addr);
+            bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+            return;
+        }
+    }
+    if (info.role == BT_CONN_ROLE_PERIPHERAL && central_ring.conn) {
+        other_addr = bt_conn_get_dst(central_ring.conn);
+        // 如果已经作为central连了同一个设备，则断掉现在新建立的peripheral连接
+        if (!bt_addr_le_cmp(new_addr, other_addr)) {
+            printk("Duplicate conn (PERIPHERAL/CENTRAL to same peer)! Disconnecting new conn (%s)\n", addr);
+            bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+            return;
+        }
+    }
+
+    // ===== 一旦有一条连接即关闭另一角色的广播/扫描，防止再被连/再去连 =====
+    if (info.role == BT_CONN_ROLE_CENTRAL) {
+        // 现在我作为central连接上别人，关闭自身“可被连”状态
+        bt_le_adv_stop(); // 关闭advertising，不接受对方再连我（做peripheral）
+        bt_scan_stop();   //（理论上作为central只需停adv即可，这里防止混乱，也停scan）
+        printk("As CENTRAL\n");
+        dk_set_led_on(CENTRAL_CON_STATUS_LED);
+        central_ring.conn = bt_conn_ref(conn);
+        central_ring.current_rssi = -50;
+        central_ring.distance = estimate_distance(-50);
+        central_ring.connection_time = k_uptime_get_32();
+        rssi_filter_init(&central_ring.rssi_filter);
+        printk("Initial dist: %s\n", distance_str[central_ring.distance]);
+        int err = bt_conn_set_security(conn, BT_SECURITY_L2);
+        if (err) printk("Set security fail: %d\n", err);
+        gatt_discover(conn);
+        k_work_schedule(&rssi_work, K_MSEC(RSSI_UPDATE_INTERVAL));
+    } else if (info.role == BT_CONN_ROLE_PERIPHERAL) {
+        // 我作为peripheral被对方连上，关闭“主动去连别人的”能力
+        bt_scan_stop(); // 关闭scan，不主动去连对方（做central）
+        bt_le_adv_stop();// 可选，加保险
+        printk("As PERIPHERAL\n");
+        dk_set_led_on(PERIPHERAL_CONN_STATUS_LED);
+        peripheral_ring.conn = bt_conn_ref(conn);
+        peripheral_ring.current_rssi = -45;
+        peripheral_ring.distance = estimate_distance(-45);
+        peripheral_ring.connection_time = k_uptime_get_32();
+        rssi_filter_init(&peripheral_ring.rssi_filter);
+        k_work_schedule(&rssi_work, K_MSEC(RSSI_UPDATE_INTERVAL));
+    }
 }
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
-	char addr[BT_ADDR_LE_STR_LEN]; bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-	printk("Disconnected: %s, reason: 0x%02x\n", addr, reason);
-	if (conn == central_ring.conn) {
-		printk("Central conn lost\n");
-		dk_set_led_off(CENTRAL_CON_STATUS_LED);
-		if (atomic_get(&lbs_client_ctx.subscribed)) atomic_set(&lbs_client_ctx.subscribed, 0);
-		atomic_set(&lbs_client_ctx.write_pending, 0);
-		bt_conn_unref(central_ring.conn); memset(&central_ring,0,sizeof(central_ring));
-		rssi_filter_init(&central_ring.rssi_filter);
-		led_set_state_locked(LED_STATE_OFF, false);
-		k_work_schedule(&reconnect_work, K_SECONDS(1));
-	} else if (conn == peripheral_ring.conn) {
-		printk("Peripheral conn lost\n"); dk_set_led_off(PERIPHERAL_CONN_STATUS_LED);
-		bt_conn_unref(peripheral_ring.conn); memset(&peripheral_ring,0,sizeof(peripheral_ring));
-		rssi_filter_init(&peripheral_ring.rssi_filter);
-		advertising_start();
-	}
-	if (!central_ring.conn && !peripheral_ring.conn)
-		memset(&lbs_client_ctx,0,sizeof(lbs_client_ctx));
+    char addr[BT_ADDR_LE_STR_LEN]; 
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+    printk("Disconnected: %s, reason: 0x%02x\n", addr, reason);
+    if (conn == central_ring.conn) {
+        printk("Central conn lost\n");
+        dk_set_led_off(CENTRAL_CON_STATUS_LED);
+        if (atomic_get(&lbs_client_ctx.subscribed)) atomic_set(&lbs_client_ctx.subscribed, 0);
+        atomic_set(&lbs_client_ctx.write_pending, 0);
+        bt_conn_unref(central_ring.conn); memset(&central_ring,0,sizeof(central_ring));
+        rssi_filter_init(&central_ring.rssi_filter);
+        led_set_state_locked(LED_STATE_OFF, false);
+        // 重新恢复adv和scan
+        k_work_schedule(&reconnect_work, K_SECONDS(1));
+    } else if (conn == peripheral_ring.conn) {
+        printk("Peripheral conn lost\n"); 
+        dk_set_led_off(PERIPHERAL_CONN_STATUS_LED);
+        bt_conn_unref(peripheral_ring.conn); memset(&peripheral_ring,0,sizeof(peripheral_ring));
+        rssi_filter_init(&peripheral_ring.rssi_filter);
+        // 重新恢复adv和scan
+        k_work_schedule(&reconnect_work, K_SECONDS(1));
+    }
+    if (!central_ring.conn && !peripheral_ring.conn)
+        memset(&lbs_client_ctx,0,sizeof(lbs_client_ctx));
 }
 static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_security_err err)
 {
