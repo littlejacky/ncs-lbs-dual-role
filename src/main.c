@@ -19,6 +19,9 @@
 #include <stdlib.h>
 #include <zephyr/sys/byteorder.h>
 
+#include "ring_types.h"
+#include "nrf54l15_power_mgr.h"
+
 /////////////////////////////////////////////////////////////////
 // ==== 1. 类型定义、全局配置块（ring_types & config） =========
 /////////////////////////////////////////////////////////////////
@@ -48,38 +51,14 @@
 #define DEBOUNCE_MS 70
 
 typedef enum {
-	DISTANCE_UNKNOWN,
-	DISTANCE_VERY_CLOSE,
-	DISTANCE_CLOSE,
-	DISTANCE_MEDIUM,
-	DISTANCE_FAR,
-	DISTANCE_VERY_FAR
-} distance_level_t;
-typedef enum {
 	LED_STATE_OFF,
 	LED_STATE_ON,
 	LED_STATE_FLASHING,
 	LED_STATE_BREATHING
 } led_state_t;
-struct rssi_filter {
-	int8_t history[RSSI_HISTORY_SIZE];
-	uint8_t index;
-	bool full;
-};
-struct ring_connection {
-	struct bt_conn *conn;
-	bool hrs_ready;
-	bool lbs_ready;
-	struct rssi_filter rssi_filter;
-	int8_t current_rssi;
-	distance_level_t distance;
-	uint32_t last_rssi_update;
-	uint16_t last_hr_value;
-	uint32_t connection_time;
-};
 
-static struct ring_connection central_ring = {0};
-static struct ring_connection peripheral_ring = {0};
+struct ring_connection central_ring = {0};
+struct ring_connection peripheral_ring = {0};
 static atomic_t app_button_state = ATOMIC_INIT(0);
 static atomic_t system_ready = ATOMIC_INIT(0);
 
@@ -187,6 +166,7 @@ static uint8_t lbs_button_notify_cb(struct bt_conn *conn,
 	uint8_t button_pressed = ((const uint8_t *)data)[0];
 	printk("👆 Partner button %s\n", button_pressed?"PRESSED":"RELEASED");
 	if (button_pressed) {
+		on_user_activity();
 		// dk_set_led(CENTRAL_CON_STATUS_LED, true); k_sleep(K_MSEC(100));
 		// dk_set_led(CENTRAL_CON_STATUS_LED, central_ring.conn?true:false);
 		led_set_state_locked(LED_STATE_ON, button_pressed);
@@ -245,6 +225,7 @@ static void button_changed(uint32_t button_state, uint32_t has_changed) {
 	static uint32_t last_button_time = 0;
 	uint32_t now = k_uptime_get_32();
 	if (has_changed & USER_BUTTON) {
+		on_user_activity();
 		if (now - last_button_time < DEBOUNCE_MS) return;
 		last_button_time = now;
 		bool pressed = button_state & USER_BUTTON;
@@ -542,7 +523,7 @@ static struct bt_data sd[] = {
 	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_LBS_VAL),
 };
 static struct k_work adv_work;
-static struct k_work_delayable rssi_work;
+// static struct k_work_delayable rssi_work;
 static struct k_work_delayable reconnect_work;
 
 static int scan_start(void) {
@@ -575,6 +556,7 @@ static void reconnect_work_handler(struct k_work *work) {
 }
 static void connected(struct bt_conn *conn, uint8_t conn_err)
 {
+	on_connection_established(conn);
     struct bt_conn_info info;
     char addr[BT_ADDR_LE_STR_LEN];
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
@@ -630,7 +612,7 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
         int err = bt_conn_set_security(conn, BT_SECURITY_L2);
         if (err) printk("Set security fail: %d\n", err);
         gatt_discover(conn);
-        k_work_schedule(&rssi_work, K_MSEC(RSSI_UPDATE_INTERVAL));
+        // k_work_schedule(&rssi_work, K_MSEC(RSSI_UPDATE_INTERVAL));
     } else if (info.role == BT_CONN_ROLE_PERIPHERAL) {
         // 我作为peripheral被对方连上，关闭“主动去连别人的”能力
         bt_scan_stop(); // 关闭scan，不主动去连对方（做central）
@@ -642,11 +624,12 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
         peripheral_ring.distance = estimate_distance(-45);
         peripheral_ring.connection_time = k_uptime_get_32();
         rssi_filter_init(&peripheral_ring.rssi_filter);
-        k_work_schedule(&rssi_work, K_MSEC(RSSI_UPDATE_INTERVAL));
+        // k_work_schedule(&rssi_work, K_MSEC(RSSI_UPDATE_INTERVAL));
     }
 }
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
+	on_connection_lost();
     char addr[BT_ADDR_LE_STR_LEN]; 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
     printk("Disconnected: %s, reason: 0x%02x\n", addr, reason);
@@ -740,40 +723,39 @@ static int scan_init(void) {
 	bt_scan_filter_enable(BT_SCAN_UUID_FILTER, false);
 	return 0;
 }
-static void rssi_work_handler(struct k_work *work)
+void rssi_update_internal(void)
 {
-	bool reschedule = false;
-	if (central_ring.conn) {
-		struct bt_conn_info info;
-		if (!bt_conn_get_info(central_ring.conn, &info) && info.state == BT_CONN_STATE_CONNECTED) {
-			int8_t new_rssi = get_real_rssi(central_ring.conn);
-			rssi_filter_add(&central_ring.rssi_filter, new_rssi);
-			int8_t filtered_rssi = rssi_filter_get_average(&central_ring.rssi_filter);
-			distance_level_t new_distance = estimate_distance(filtered_rssi);
-			if (new_distance != central_ring.distance || abs(filtered_rssi-central_ring.current_rssi)>3) {
-				printk("Central Ring - RSSI %d, %s->%s\n", filtered_rssi, distance_str[central_ring.distance], distance_str[new_distance]);
-				central_ring.current_rssi = filtered_rssi;
-				central_ring.distance = new_distance;
-			}
-			reschedule = true;
-		}
-	}
-	if (peripheral_ring.conn) {
-		struct bt_conn_info info;
-		if (!bt_conn_get_info(peripheral_ring.conn, &info) && info.state == BT_CONN_STATE_CONNECTED) {
-			int8_t new_rssi = get_real_rssi(peripheral_ring.conn)+5;
-			rssi_filter_add(&peripheral_ring.rssi_filter, new_rssi);
-			int8_t filtered_rssi = rssi_filter_get_average(&peripheral_ring.rssi_filter);
-			distance_level_t new_distance = estimate_distance(filtered_rssi);
-			if (new_distance != peripheral_ring.distance || abs(filtered_rssi-peripheral_ring.current_rssi)>3) {
-				printk("Peripheral Ring - RSSI %d, %s->%s\n", filtered_rssi, distance_str[peripheral_ring.distance], distance_str[new_distance]);
-				peripheral_ring.current_rssi = filtered_rssi;
-				peripheral_ring.distance = new_distance;
-			}
-			reschedule = true;
-		}
-	}
-	if (reschedule) k_work_schedule(&rssi_work, K_MSEC(RSSI_UPDATE_INTERVAL));
+    bool updated = false;
+    if (central_ring.conn) {
+        struct bt_conn_info info;
+        if (!bt_conn_get_info(central_ring.conn, &info) && info.state == BT_CONN_STATE_CONNECTED) {
+            int8_t new_rssi = get_real_rssi(central_ring.conn);
+            rssi_filter_add(&central_ring.rssi_filter, new_rssi);
+            int8_t filtered_rssi = rssi_filter_get_average(&central_ring.rssi_filter);
+            distance_level_t new_distance = estimate_distance(filtered_rssi);
+            if (new_distance != central_ring.distance || abs(filtered_rssi-central_ring.current_rssi)>3) {
+                printk("Central Ring - RSSI %d, %s->%s\n", filtered_rssi, distance_str[central_ring.distance], distance_str[new_distance]);
+                central_ring.current_rssi = filtered_rssi;
+                central_ring.distance = new_distance;
+            }
+            updated = true;
+        }
+    }
+    if (peripheral_ring.conn) {
+        struct bt_conn_info info;
+        if (!bt_conn_get_info(peripheral_ring.conn, &info) && info.state == BT_CONN_STATE_CONNECTED) {
+            int8_t new_rssi = get_real_rssi(peripheral_ring.conn)+5;
+            rssi_filter_add(&peripheral_ring.rssi_filter, new_rssi);
+            int8_t filtered_rssi = rssi_filter_get_average(&peripheral_ring.rssi_filter);
+            distance_level_t new_distance = estimate_distance(filtered_rssi);
+            if (new_distance != peripheral_ring.distance || abs(filtered_rssi-peripheral_ring.current_rssi)>3) {
+                printk("Peripheral Ring - RSSI %d, %s->%s\n", filtered_rssi, distance_str[peripheral_ring.distance], distance_str[new_distance]);
+                peripheral_ring.current_rssi = filtered_rssi;
+                peripheral_ring.distance = new_distance;
+            }
+            updated = true;
+        }
+    }
 }
 
 /////////////////////////////////////////////////////////////////
@@ -805,6 +787,8 @@ static void status_monitor_thread(void) {
 		k_sleep(K_MSEC(10000));
 		if (!atomic_get(&system_ready)) continue;
 		printk("\n=== SMART RING STATUS ===\n");
+		print_power_statistics();
+		printk("Battery: %d%%, Power mode: %d\n", get_battery_level(), get_current_power_mode());
 		printk("Uptime: %u s\n", k_uptime_get_32()/1000);
 		if (central_ring.conn) {
 			uint32_t conn_time = (k_uptime_get_32()-central_ring.connection_time)/1000;
@@ -828,64 +812,69 @@ static void status_monitor_thread(void) {
 
 int main(void)
 {
-	int err;
-	printk("\n=== SMART RING v2.0 Modular ===\n");
-	printk("Initializing...\n");
+    int err;
+    printk("\n=== SMART RING v2.0 Modular ===\n");
+    printk("Initializing...\n");
 
-	err = dk_leds_init();
-	if (err) { printk("LED init failed: %d\n", err); return err; }
-	err = init_button();
-	if (err) { printk("Button init failed: %d\n", err); return err; }
+    // 新增：功耗优化模块初始化，放在初始化最前面即可
+    init_nrf54l15_power_optimization();
 
-	k_mutex_init(&led_manager.mutex);
-	k_work_init_delayable(&led_manager.flash_work, led_flash_work_handler);
-	k_work_init_delayable(&led_manager.breathing_work, led_breathing_work_handler);
-	led_manager.state = LED_STATE_OFF;
-	atomic_set(&led_manager.flash_active, 0);
+    err = dk_leds_init();
+    if (err) { printk("LED init failed: %d\n", err); return err; }
+    err = init_button();
+    if (err) { printk("Button init failed: %d\n", err); return err; }
 
-	k_work_init(&adv_work, adv_work_handler);
-	k_work_init_delayable(&rssi_work, rssi_work_handler);
-	k_work_init_delayable(&reconnect_work, reconnect_work_handler);
+    k_mutex_init(&led_manager.mutex);
+    k_work_init_delayable(&led_manager.flash_work, led_flash_work_handler);
+    k_work_init_delayable(&led_manager.breathing_work, led_breathing_work_handler);
+    led_manager.state = LED_STATE_OFF;
+    atomic_set(&led_manager.flash_active, 0);
 
-	bt_conn_auth_cb_register(&auth_callbacks);
-	bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
+    k_work_init(&adv_work, adv_work_handler);
+    // **删除**：k_work_init_delayable(&rssi_work, rssi_work_handler);
+    // **删除所有与rssi_work相关的调度**
 
-	printk("Enabling Bluetooth...\n");
-	err = bt_enable(NULL);
-	if (err) { printk("Bluetooth enable failed: %d\n", err); return err; }
-	if (IS_ENABLED(CONFIG_SETTINGS)) { printk("Loading settings...\n"); settings_load(); }
+    k_work_init_delayable(&reconnect_work, reconnect_work_handler);
 
-	err = bt_hrs_client_init(&hrs_c);
-	if (err) { printk("HRS client init failed: %d\n", err); return err; }
-	err = bt_lbs_init(&lbs_callbacks);
-	if (err) { printk("LBS service init failed: %d\n", err); return err; }
+    bt_conn_auth_cb_register(&auth_callbacks);
+    bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
 
-	memset(&central_ring,0,sizeof(central_ring));
-	memset(&peripheral_ring,0,sizeof(peripheral_ring));
-	memset(&lbs_client_ctx,0,sizeof(lbs_client_ctx));
-	rssi_filter_init(&central_ring.rssi_filter);
-	rssi_filter_init(&peripheral_ring.rssi_filter);
+    printk("Enabling Bluetooth...\n");
+    err = bt_enable(NULL);
+    if (err) { printk("Bluetooth enable failed: %d\n", err); return err; }
+    if (IS_ENABLED(CONFIG_SETTINGS)) { printk("Loading settings...\n"); settings_load(); }
 
-	err = scan_init();
-	if (err) { printk("Scan init failed: %d\n", err); return err; }
+    err = bt_hrs_client_init(&hrs_c);
+    if (err) { printk("HRS client init failed: %d\n", err); return err; }
+    err = bt_lbs_init(&lbs_callbacks);
+    if (err) { printk("LBS service init failed: %d\n", err); return err; }
 
-	atomic_set(&system_ready, 1);
-	printk("Starting scan & advertising...\n");
-	scan_start();
-	advertising_start();
+    memset(&central_ring,0,sizeof(central_ring));
+    memset(&peripheral_ring,0,sizeof(peripheral_ring));
+    memset(&lbs_client_ctx,0,sizeof(lbs_client_ctx));
+    rssi_filter_init(&central_ring.rssi_filter);
+    rssi_filter_init(&peripheral_ring.rssi_filter);
 
-	printk("=== System Ready ===\n");
-	printk("Press button for partner\n");
-	printk("Auto connect\n");
+    err = scan_init();
+    if (err) { printk("Scan init failed: %d\n", err); return err; }
 
-	while (1) {
-		if (atomic_get(&system_ready)) {
-			bool led_state = (k_uptime_get_32()/RUN_LED_BLINK_INTERVAL)%2;
-			dk_set_led(RUN_STATUS_LED, led_state);
-		}
-		k_sleep(K_MSEC(RUN_LED_BLINK_INTERVAL));
-	}
-	return 0;
+    atomic_set(&system_ready, 1);
+    printk("Starting scan & advertising...\n");
+    scan_start();
+    advertising_start();
+
+    printk("=== System Ready ===\n");
+    printk("Press button for partner\n");
+    printk("Auto connect\n");
+
+    while (1) {
+        if (atomic_get(&system_ready)) {
+            bool led_state = (k_uptime_get_32()/RUN_LED_BLINK_INTERVAL)%2;
+            dk_set_led(RUN_STATUS_LED, led_state);
+        }
+        k_sleep(K_MSEC(RUN_LED_BLINK_INTERVAL));
+    }
+    return 0;
 }
 
 // ---- 线程定义 ----

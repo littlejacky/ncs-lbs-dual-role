@@ -11,6 +11,7 @@ project(lbs)
 # NORDIC SDK APP START
 target_sources(app PRIVATE
   src/main.c
+  src/nrf54l15_power_mgr.c
 )
 
 # NORDIC SDK APP END
