@@ -15,3 +15,4 @@ target_sources(app PRIVATE
 )
 
 # NORDIC SDK APP END
+target_include_directories(app PRIVATE include)

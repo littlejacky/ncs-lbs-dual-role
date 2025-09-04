@@ -1,3 +1,4 @@
+// ring_types.h
 #ifndef RING_TYPES_H
 #define RING_TYPES_H
 

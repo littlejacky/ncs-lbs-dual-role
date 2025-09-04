@@ -1,3 +1,4 @@
+// nrf54l15_power_mgr.h
 #ifndef NRF54L15_POWER_MGR_H
 #define NRF54L15_POWER_MGR_H
 #include "ring_types.h"
